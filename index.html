@@ -575,9 +575,18 @@
       const audioChunks = [];
       const words = [];
       let settled = false;
-      const timeout = setTimeout(() => {
+      // Activity-based timeout: resets every time a message arrives, so long
+      // synthesis jobs don't get killed just because the whole thing takes a while —
+      // only a real stall (no data for INACTIVITY_MS) triggers it.
+      const INACTIVITY_MS = 20000;
+      let timeout = setTimeout(onTimeout, INACTIVITY_MS);
+      function onTimeout() {
         if (!settled) { settled = true; try { ws.close(); } catch(e){}; reject(new Error('အချိန်ကုန်သွားပါပြီ (timeout)။ Edge TTS ကို ဤ browser တွင် ဆက်သွယ်၍ မရနိုင်ပါ — Gemini TTS ကို စမ်းကြည့်ပါ။')); }
-      }, 15000);
+      }
+      function bumpTimeout() {
+        clearTimeout(timeout);
+        timeout = setTimeout(onTimeout, INACTIVITY_MS);
+      }
 
       ws.onopen = () => {
         const requestId = uuid32();
@@ -594,6 +603,7 @@
       };
 
       ws.onmessage = (event) => {
+        bumpTimeout();
         if (typeof event.data === 'string') {
           const sep = event.data.indexOf('\r\n\r\n');
           const headerPart = event.data.substring(0, sep);
@@ -633,15 +643,70 @@
     });
   }
 
+  // Edge's socket can choke on very long single requests (and mobile connections
+  // can stall on them). Split long text into sentence-aligned pieces and
+  // synthesize them one request at a time, then stitch the results together.
+  function splitTextIntoChunks(text, maxLen = 1500) {
+    const enders = /([။၊.!?]\s*)/;
+    const pieces = text.split(enders);
+    // re-glue split() capture groups (punctuation) back onto the preceding piece
+    const sentences = [];
+    for (let i = 0; i < pieces.length; i += 2) {
+      const s = (pieces[i] || '') + (pieces[i + 1] || '');
+      if (s.trim()) sentences.push(s);
+    }
+    if (sentences.length === 0) return [text];
+
+    const chunks = [];
+    let cur = '';
+    for (const s of sentences) {
+      if (cur && (cur.length + s.length) > maxLen) {
+        chunks.push(cur);
+        cur = s;
+      } else {
+        cur += s;
+      }
+      // a single sentence longer than maxLen on its own: hard-split it
+      while (cur.length > maxLen * 1.5) {
+        chunks.push(cur.slice(0, maxLen));
+        cur = cur.slice(maxLen);
+      }
+    }
+    if (cur.trim()) chunks.push(cur);
+    return chunks;
+  }
+
   async function runEdge(text) {
     const rate = parseInt(rateSlider.value, 10);
     const pitch = parseInt(pitchSlider.value, 10);
-    setStatus('Edge TTS သို့ ချိတ်ဆက်နေသည်...');
-    const { audioChunks, words } = await generateEdge(text, edgeVoice, rate, pitch);
-    if (audioChunks.length === 0) throw new Error('အသံဒေတာ မရရှိပါ။ ထပ်မံကြိုးစားကြည့်ပါ။');
-    const blob = new Blob(audioChunks, { type: 'audio/mpeg' });
+    const chunks = splitTextIntoChunks(text);
+
+    const allAudioParts = [];
+    const allWords = [];
+    let timeOffset = 0;
+
+    for (let i = 0; i < chunks.length; i++) {
+      setStatus(chunks.length > 1
+        ? `Edge TTS — အပိုင်း ${i + 1}/${chunks.length} ဖန်တီးနေသည်...`
+        : 'Edge TTS သို့ ချိတ်ဆက်နေသည်...');
+
+      const { audioChunks, words } = await generateEdge(chunks[i], edgeVoice, rate, pitch);
+      if (audioChunks.length === 0) throw new Error(`အပိုင်း ${i + 1} တွင် အသံဒေတာ မရရှိပါ။ ထပ်မံကြိုးစားကြည့်ပါ။`);
+
+      allAudioParts.push(...audioChunks);
+      words.forEach(w => allWords.push({ text: w.text, start: w.start + timeOffset, end: w.end + timeOffset }));
+
+      // advance the offset by this chunk's real audio duration so the next
+      // chunk's word timings line up with where its audio actually starts
+      const chunkBlob = new Blob(audioChunks, { type: 'audio/mpeg' });
+      const chunkDuration = await getAudioDuration(chunkBlob);
+      const lastWordEnd = words.length ? words[words.length - 1].end : 0;
+      timeOffset += Math.max(chunkDuration, lastWordEnd);
+    }
+
+    const blob = new Blob(allAudioParts, { type: 'audio/mpeg' });
     const url = URL.createObjectURL(blob);
-    const cues = words.length ? groupWordsToCues(words) : [{ start: 0, end: 0, text: text }];
+    const cues = allWords.length ? groupWordsToCues(allWords) : [{ start: 0, end: 0, text: text }];
     return { url, filename: 'recapvoice-edge.mp3', srt: buildSrt(cues), cues };
   }
 
@@ -767,4 +832,3 @@
 </script>
 </body>
 </html>
-ဟ
