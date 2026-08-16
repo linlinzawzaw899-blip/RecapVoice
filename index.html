@@ -316,8 +316,8 @@
         <div class="field">
           <label>Rate (အမြန်နှုန်း)</label>
           <div class="slider-row">
-            <input type="range" id="edge-rate" min="-50" max="50" value="0">
-            <span class="slider-val" id="edge-rate-val">+0%</span>
+            <input type="range" id="edge-rate" min="-50" max="100" value="20">
+            <span class="slider-val" id="edge-rate-val">+20%</span>
           </div>
         </div>
         <div class="field">
@@ -748,11 +748,24 @@
     return parts.length ? parts : [text];
   }
 
+  // HTMLMediaElement duration on a Blob URL is unreliable for streamed mp3
+  // (Chrome/Safari often report Infinity or 0 the first time metadata loads),
+  // which was the root cause of chunk offsets going wrong / times jumping
+  // backwards partway through long files. Fully decoding the audio gives an
+  // exact, trustworthy duration instead.
+  let _sharedAudioCtx = null;
   async function getAudioDuration(blob) {
+    try {
+      if (!_sharedAudioCtx) _sharedAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const arrayBuffer = await blob.arrayBuffer();
+      const audioBuffer = await _sharedAudioCtx.decodeAudioData(arrayBuffer.slice(0));
+      if (isFinite(audioBuffer.duration) && audioBuffer.duration > 0) return audioBuffer.duration;
+    } catch (e) { /* fall through to media-element fallback */ }
+
     return new Promise((resolve) => {
       const a = new Audio();
       a.src = URL.createObjectURL(blob);
-      a.addEventListener('loadedmetadata', () => resolve(a.duration || 0));
+      a.addEventListener('loadedmetadata', () => resolve(isFinite(a.duration) ? a.duration : 0));
       a.addEventListener('error', () => resolve(0));
     });
   }
